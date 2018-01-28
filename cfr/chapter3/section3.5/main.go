@@ -159,17 +159,25 @@ func (dudo Dudo) CurPlayer() int {
 	return player
 }
 
-func (dudo Dudo) Infoset() string {
+func (dudo Dudo) InfosetLen() int {
 	playerDices := dudo.dices[dudo.CurPlayer()]
+	size := len(playerDices)
+	size += 1 // for the separator '|'
+	size += len(dudo.history)
+	return size
+}
 
-	diceStr := make([]uint8, 0, len(playerDices))
-	for _, d := range playerDices {
-		diceStr = append(diceStr, d)
-	}
-	infoset := append(diceStr, '|')
-	infoset = append(infoset, dudo.history...)
+func (dudo Dudo) Infoset(outInfoset []uint8) {
+	cursor := 0
 
-	return string(infoset)
+	playerDices := dudo.dices[dudo.CurPlayer()]
+	copy(outInfoset[cursor:], playerDices)
+	cursor += len(playerDices)
+
+	outInfoset[cursor] = '|'
+	cursor += 1
+
+	copy(outInfoset[cursor:], dudo.history)
 }
 
 func (dudo Dudo) IsTerminal() bool {
@@ -180,7 +188,7 @@ func (dudo Dudo) IsTerminal() bool {
 	return int(lastAct) == len(dudo.claims)
 }
 
-func (dudo Dudo) Payoff() []float64 {
+func (dudo Dudo) Payoff(outPayoff []float64) {
 	// Find the player who challenged Dudo.
 	numPlayers := len(dudo.dices)
 	dudoIdx := len(dudo.history) - 1
@@ -204,21 +212,19 @@ func (dudo Dudo) Payoff() []float64 {
 
 	// If actual rank count is equal to claim,
 	// the player who makes the claim wins, and everyone else pays her one dice.
-	payoff := make([]float64, numPlayers)
 	if actual == int(claim.Num) {
 		for p := 0; p < numPlayers; p++ {
 			if p == claimPlayer {
-				payoff[p] = float64(numPlayers) - 1
+				outPayoff[p] = float64(numPlayers) - 1
 			} else {
-				payoff[p] = -1
+				outPayoff[p] = -1
 			}
 		}
-		return payoff
+		return
 	}
 
-	payoff[claimPlayer] = float64(actual - int(claim.Num))
-	payoff[dudoPlayer] = float64(int(claim.Num) - actual)
-	return payoff
+	outPayoff[claimPlayer] = float64(actual - int(claim.Num))
+	outPayoff[dudoPlayer] = float64(int(claim.Num) - actual)
 }
 
 func (dudo Dudo) IsChanceNode() bool {
@@ -235,83 +241,178 @@ func (dudo Dudo) SampleChance() {
 	}
 }
 
-func (dudo Dudo) Actions() []uint8 {
+func (dudo Dudo) ActionsLen() int {
 	if len(dudo.history) == 0 {
-		actions := make([]uint8, len(dudo.claims))
-		for i := 0; i < len(actions); i++ {
-			actions[i] = uint8(i)
-		}
-		return actions
+		return len(dudo.claims)
 	}
 
 	lastClaim := dudo.history[len(dudo.history)-1]
 	dudoAct := len(dudo.claims)
-	actions := make([]uint8, 0, dudoAct-int(lastClaim))
-	for i := int(lastClaim) + 1; i <= dudoAct; i++ {
-		actions = append(actions, uint8(i))
-	}
-	return actions
+	return dudoAct - int(lastClaim)
 }
 
-func getInfosetNode(dudo Dudo, nodeMap map[string]*Node) *Node {
-	infoset := dudo.Infoset()
-	node, ok := nodeMap[infoset]
+func (dudo Dudo) Actions(outActions []uint8) {
+	if len(dudo.history) == 0 {
+		for i := 0; i < len(outActions); i++ {
+			outActions[i] = uint8(i)
+		}
+		return
+	}
+
+	lastClaim := int(dudo.history[len(dudo.history)-1])
+	for i := 0; i < len(outActions); i++ {
+		outActions[i] = uint8(i + lastClaim + 1)
+	}
+}
+
+func getInfosetNode(dudo Dudo, nodeMap map[string]*Node, isBuf []uint8) *Node {
+	dudo.Infoset(isBuf)
+	node, ok := nodeMap[string(isBuf)]
 	if !ok {
-		numActions := len(dudo.Actions())
-		node = NewNode(numActions)
-		node.InfoSet = infoset
-		nodeMap[infoset] = node
+		node = NewNode(dudo.ActionsLen())
+		node.InfoSet = string(isBuf)
+		nodeMap[node.InfoSet] = node
 	}
 	return node
 }
 
-type Stack struct {
-	f64      []float64
-	f64Cur   int
-	f64Enter int
+type F64Stack struct {
+	buf []float64
+	cur int
 }
 
-func NewStack() *Stack {
-	stk := &Stack{
-		f64: make([]float64, 0, 1024*1024),
+func NewF64Stack() *F64Stack {
+	stk := &F64Stack{
+		buf: make([]float64, 1024*1024),
 	}
 	return stk
 }
 
-func (stk *Stack) Enter() {
-	stk.f64Enter = stk.f64Cur
+func (stk *F64Stack) Enter() int {
+	return stk.cur
 }
 
-func (stk *Stack) Leave() {
-	stk.f64Cur = stk.f64Enter
+func (stk *F64Stack) Leave(cur int) {
+	stk.cur = cur
+}
+
+func (stk *F64Stack) Grow(size int) []float64 {
+	cur := stk.cur
+	stk.cur += size
+	if stk.cur > len(stk.buf) {
+		newBuf := make([]float64, stk.cur*2)
+		copy(newBuf, stk.buf)
+		stk.buf = newBuf
+	}
+
+	res := stk.buf[cur:stk.cur]
+	for i := range res {
+		res[i] = 0
+	}
+	return res
+}
+
+type Uint8Stack struct {
+	buf []uint8
+	cur int
+}
+
+func NewUint8Stack() *Uint8Stack {
+	stk := &Uint8Stack{
+		buf: make([]uint8, 1024*1024),
+	}
+	return stk
+}
+
+func (stk *Uint8Stack) Enter() int {
+	return stk.cur
+}
+
+func (stk *Uint8Stack) Leave(cur int) {
+	stk.cur = cur
+}
+
+func (stk *Uint8Stack) Grow(size int) []uint8 {
+	cur := stk.cur
+	stk.cur += size
+	if stk.cur > len(stk.buf) {
+		newBuf := make([]uint8, stk.cur*2)
+		copy(newBuf, stk.buf)
+		stk.buf = newBuf
+	}
+
+	res := stk.buf[cur:stk.cur]
+	for i := range res {
+		res[i] = 0
+	}
+	return res
+}
+
+type Stack struct {
+	f64Stk   *F64Stack
+	uint8Stk *Uint8Stack
+}
+
+func NewStack() *Stack {
+	stk := &Stack{
+		f64Stk:   NewF64Stack(),
+		uint8Stk: NewUint8Stack(),
+	}
+	return stk
+}
+
+func (stk *Stack) Enter() [2]int {
+	cursor := [2]int{
+		stk.f64Stk.Enter(),
+		stk.uint8Stk.Enter(),
+	}
+	return cursor
+}
+
+func (stk *Stack) Leave(cursor [2]int) {
+	stk.f64Stk.Leave(cursor[0])
+	stk.uint8Stk.Leave(cursor[1])
 }
 
 func (stk *Stack) GrowF64(size int) []float64 {
-	cur := stk.f64Cur
-	stk.f64Cur += size
-	return stk.f64[cur:size]
+	return stk.f64Stk.Grow(size)
 }
 
-func cfr(dudo Dudo, probs []float64, nodeMap map[string]*Node) []float64 {
+func (stk *Stack) GrowUint8(size int) []uint8 {
+	return stk.uint8Stk.Grow(size)
+}
+
+func cfr(dudo Dudo, probs []float64, nodeMap map[string]*Node, stack *Stack) []float64 {
+	numPlayers := len(dudo.dices)
 	if dudo.IsTerminal() {
-		return dudo.Payoff()
+		cursor := stack.Enter()
+		payoff := stack.GrowF64(numPlayers)
+		dudo.Payoff(payoff)
+		stack.Leave(cursor)
+		return payoff
 	}
 	if dudo.IsChanceNode() {
 		dudo.SampleChance()
-		return cfr(dudo, probs, nodeMap)
+		return cfr(dudo, probs, nodeMap, stack)
 	}
 
-	// Calculate the utilities for all players.
-	numPlayers := len(dudo.dices)
-	util := make([]float64, numPlayers)
-	// Calculate the utility for the actions of the current player.
-	actions := dudo.Actions()
-	actionUtil := make([]float64, len(actions))
+	cursor := stack.Enter()
 
-	player := dudo.CurPlayer()
-	node := getInfosetNode(dudo, nodeMap)
-	strategy := make([]float64, len(actions))
+	// Create buffer for the utilities for all players.
+	util := stack.GrowF64(numPlayers)
+	// Get the list of allowed actions.
+	actions := stack.GrowUint8(dudo.ActionsLen())
+	dudo.Actions(actions)
+	// Create buffer for the utility for the actions of the current player.
+	actionUtil := stack.GrowF64(len(actions))
+	// Get the strategy, which is the probabilities of each action.
+	infosetBuf := stack.GrowUint8(dudo.InfosetLen())
+	node := getInfosetNode(dudo, nodeMap, infosetBuf)
+	strategy := stack.GrowF64(len(actions))
 	node.GetStrategy(strategy)
+
+	// Calculate the utilities.
+	player := dudo.CurPlayer()
 	for aIdx, a := range actions {
 		actProb := strategy[aIdx]
 
@@ -320,12 +421,12 @@ func cfr(dudo Dudo, probs []float64, nodeMap map[string]*Node) []float64 {
 		stDudo.history = append(stDudo.history, a)
 
 		// Create the history probabilities for the subtree.
-		stProbs := make([]float64, len(probs))
+		stProbs := stack.GrowF64(len(probs))
 		copy(stProbs, probs)
 		stProbs[player] *= actProb
 
 		// Calculate all players' utilities of the subtree.
-		stUtil := cfr(stDudo, stProbs, nodeMap)
+		stUtil := cfr(stDudo, stProbs, nodeMap, stack)
 
 		actionUtil[aIdx] = stUtil[player]
 		for p, playerUtil := range util {
@@ -357,6 +458,7 @@ func cfr(dudo Dudo, probs []float64, nodeMap map[string]*Node) []float64 {
 	// }
 	// node.prob = append(node.prob, nodeProb)
 
+	stack.Leave(cursor)
 	return util
 }
 
@@ -474,19 +576,20 @@ func main() {
 		probs[player] = 1
 	}
 
-	var diceFaces uint8 = 3
+	var diceFaces uint8 = 6
 	nodeMap := make(map[string]*Node)
 
 	dudo := NewDudo(diceFaces, numDices)
 	glog.Infof("Claims: %+v", dudo.claims)
+	stack := NewStack()
 
 	// Train our algorithm.
-	iterations := 1000000
+	iterations := 100000
 	utilLogger := NewAvgLogger("util", numPlayers, iterations/100)
 	utilLogger.Precision = 6
 	for i := 0; i < iterations; i++ {
 		dudo := NewDudo(diceFaces, numDices)
-		util := cfr(dudo, probs, nodeMap)
+		util := cfr(dudo, probs, nodeMap, stack)
 
 		utilLogger.Add(util)
 	}
