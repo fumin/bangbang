@@ -6,8 +6,10 @@ import (
 	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/golang/glog"
 )
@@ -38,8 +40,6 @@ type Node struct {
 	RegretSum   []float64
 	StrategySum []float64
 	strategy    []float64
-
-	// prob []float64
 }
 
 func NewNode(numActions int) *Node {
@@ -47,7 +47,6 @@ func NewNode(numActions int) *Node {
 		RegretSum:   make([]float64, numActions),
 		StrategySum: make([]float64, numActions),
 		strategy:    make([]float64, numActions),
-		// prob:        make([]float64, 0),
 	}
 	return node
 }
@@ -451,14 +450,117 @@ func cfr(dudo Dudo, probs []float64, nodeMap map[string]*Node, stack *Stack) []f
 		node.StrategySum[aIdx] += probI * strategy[aIdx]
 	}
 
-	// Debug
-	// var nodeProb float64 = 1
-	// for _, prb := range probs {
-	// 	nodeProb *= prb
-	// }
-	// node.prob = append(node.prob, nodeProb)
-
 	stack.Leave(cursor)
+	return util
+}
+
+func cfrpar(dudo Dudo, probs []float64, nodeMaps []map[string]*Node, stacks []*Stack) []float64 {
+	numPlayers := len(dudo.dices)
+	if dudo.IsTerminal() {
+		payoff := make([]float64, numPlayers)
+		dudo.Payoff(payoff)
+		return payoff
+	}
+	if dudo.IsChanceNode() {
+		dudo.SampleChance()
+		return cfrpar(dudo, probs, nodeMaps, stacks)
+	}
+
+	// Create buffer for the utilities for all players.
+	util := make([]float64, numPlayers)
+	// Get the list of allowed actions.
+	actions := make([]uint8, dudo.ActionsLen())
+	dudo.Actions(actions)
+	// Create buffer for the utility for the actions of the current player.
+	actionUtil := make([]float64, len(actions))
+	// Get the strategy, which is the probabilities of each action.
+	infosetBuf := make([]uint8, dudo.InfosetLen())
+	node := getInfosetNode(dudo, nodeMaps[0], infosetBuf)
+	strategy := make([]float64, len(actions))
+	node.GetStrategy(strategy)
+
+	type Act struct {
+		idx    int
+		action uint8
+	}
+	workerActions := make([][]Act, len(nodeMaps))
+	for i, a := range actions {
+		workerI := i % len(workerActions)
+		act := Act{idx: i, action: a}
+		workerActions[workerI] = append(workerActions[workerI], act)
+	}
+
+	// Calculate the utilities.
+	player := dudo.CurPlayer()
+	type UtilRes struct {
+		aIdx   int
+		stUtil []float64
+	}
+	utilChan := make(chan UtilRes)
+	var wg sync.WaitGroup
+	for workerI := range workerActions {
+		wg.Add(1)
+		go func(workerI int) {
+			defer wg.Done()
+			actions := workerActions[workerI]
+			nodeMap := nodeMaps[workerI]
+			stack := stacks[workerI]
+			cursor := stack.Enter()
+			for _, act := range actions {
+				aIdx := act.idx
+				a := act.action
+
+				actProb := strategy[aIdx]
+
+				// Create the new state in the subtree.
+				stDudo := dudo
+				stDudo.history = append(stDudo.history, a)
+
+				// Create the history probabilities for the subtree.
+				stProbs := stack.GrowF64(len(probs))
+				copy(stProbs, probs)
+				stProbs[player] *= actProb
+
+				// Calculate all players' utilities of the subtree.
+				stUtil := cfr(stDudo, stProbs, nodeMap, stack)
+
+				ur := UtilRes{aIdx: aIdx, stUtil: make([]float64, len(stUtil))}
+				copy(ur.stUtil, stUtil)
+				utilChan <- ur
+			}
+			stack.Leave(cursor)
+		}(workerI)
+	}
+	go func() {
+		wg.Wait()
+		close(utilChan)
+	}()
+	for ur := range utilChan {
+		actionUtil[ur.aIdx] = ur.stUtil[player]
+
+		actProb := strategy[ur.aIdx]
+		for p, playerUtil := range util {
+			util[p] = playerUtil + actProb*ur.stUtil[p]
+		}
+	}
+
+	// Calculate the counterfactual probability.
+	var probNegI float64 = 1
+	for p, prb := range probs {
+		if p == player {
+			continue
+		}
+		probNegI *= prb
+	}
+	// Update the regrets.
+	probI := probs[player]
+	avgUtil := util[player]
+	for aIdx, aUtil := range actionUtil {
+		regret := aUtil - avgUtil
+		node.RegretSum[aIdx] += probNegI * regret
+		node.StrategySum[aIdx] += probI * strategy[aIdx]
+	}
+
 	return util
 }
 
@@ -512,14 +614,7 @@ func printNodeMap(nodeMap map[string]*Node, numPlayers int) {
 			n := nodeMap[is]
 			avgStrat := n.AvgStrategy()
 
-			// var avgProb float64 = 0
-			// for _, prb := range n.prob {
-			// 	avgProb += prb
-			// }
-			// avgProb /= float64(len(n.prob))
-
 			fmt.Printf("%6s: %s\n", fmtInfoset(n.InfoSet), fmtFloatSlice(avgStrat, 2))
-			// fmt.Printf("%6s: %f, strat: %s\n", fmtInfoset(n.InfoSet), avgProb, fmtFloatSlice(avgStrat))
 		}
 		fmt.Printf("\n")
 	}
@@ -535,6 +630,9 @@ type AvgLogger struct {
 }
 
 func NewAvgLogger(prefix string, length, logEvery int) *AvgLogger {
+	if logEvery < 1 {
+		logEvery = 1
+	}
 	al := &AvgLogger{
 		Precision: 2,
 		sum:       make([]float64, length),
@@ -565,7 +663,7 @@ func main() {
 	flag.Parse()
 
 	go func() {
-		glog.Fatal(http.ListenAndServe("localhost:6060", nil))
+		glog.Fatal(http.ListenAndServe("localhost:6061", nil))
 	}()
 
 	numDices := []uint8{1, 1}
@@ -577,11 +675,18 @@ func main() {
 	}
 
 	var diceFaces uint8 = 6
-	nodeMap := make(map[string]*Node)
 
 	dudo := NewDudo(diceFaces, numDices)
 	glog.Infof("Claims: %+v", dudo.claims)
-	stack := NewStack()
+
+	// Create resources for our workers.
+	numWorkers := runtime.NumCPU()
+	stacks := make([]*Stack, numWorkers)
+	nodeMaps := make([]map[string]*Node, numWorkers)
+	for i := range stacks {
+		stacks[i] = NewStack()
+		nodeMaps[i] = make(map[string]*Node)
+	}
 
 	// Train our algorithm.
 	iterations := 1000000
@@ -589,10 +694,16 @@ func main() {
 	utilLogger.Precision = 6
 	for i := 0; i < iterations; i++ {
 		dudo := NewDudo(diceFaces, numDices)
-		util := cfr(dudo, probs, nodeMap, stack)
+		util := cfrpar(dudo, probs, nodeMaps, stacks)
 
 		utilLogger.Add(util)
 	}
 
+	nodeMap := make(map[string]*Node)
+	for _, nm := range nodeMaps {
+		for k, v := range nm {
+			nodeMap[k] = v
+		}
+	}
 	printNodeMap(nodeMap, numPlayers)
 }
